@@ -814,6 +814,15 @@ async function joinRoom(name) {
 
   setStatus('live');
 
+  // Load saved chat messages
+  if (data && data.chat_messages && data.chat_messages.length > 0) {
+    const msgs = document.getElementById('chat-messages');
+    msgs.innerHTML = '';
+    data.chat_messages.forEach(m => {
+      appendChat(m.text, m.sender === myId, m.time, true);
+    });
+  }
+
   // Realtime text/code sync
   subscription = db.channel('room:'+roomName)
     .on('postgres_changes', { event:'UPDATE', schema:'public', table:'rooms', filter:`id=eq.${roomName}` }, payload => {
@@ -832,7 +841,7 @@ async function joinRoom(name) {
     })
     .subscribe();
 
-  // Chat realtime
+  // Chat realtime — broadcast for live + save to DB for persistence
   chatSubscription = db.channel('chat:'+roomName)
     .on('broadcast', { event:'msg' }, ({ payload }) => {
       if (payload.sender !== myId) {
@@ -969,7 +978,7 @@ async function uploadFile(file) {
       <div class="file-name">${file.name}</div>
       <div class="file-size">${formatBytes(file.size)}</div>
     </div>
-    <a class="file-dl" href="${url}" target="_blank" download="${file.name}">⬇ Download</a>`;
+    <button class="file-dl" onclick="forceDownload('${url}','${file.name.replace(/'/g,"\\'")}')">⬇ Download</button>`;
 
   showToast('File uploaded ✓');
 }
@@ -991,7 +1000,7 @@ async function loadFiles() {
         <div class="file-name">${name}</div>
         <div class="file-size">${formatBytes(f.metadata?.size||0)}</div>
       </div>
-      <a class="file-dl" href="${urlData.publicUrl}" target="_blank" download="${name}">⬇ Download</a>`;
+      <button class="file-dl" onclick="forceDownload('${urlData.publicUrl}','${name.replace(/'/g,"\\'")}')">⬇ Download</button>`;
     list.appendChild(item);
   });
 }
@@ -1011,10 +1020,11 @@ function toggleChat() {
   }
 }
 
-function appendChat(text, own, time) {
+function appendChat(text, own, time, isHistory=false) {
   const msgs = document.getElementById('chat-messages');
   const div = document.createElement('div');
-  div.className = 'chat-msg ' + (own ? 'own' : 'other');
+  // For history messages we can't know which were ours, show all as other
+  div.className = 'chat-msg ' + (own && !isHistory ? 'own' : 'other');
   div.innerHTML = `<div>${escapeHtml(text)}</div><div class="msg-time">${time}</div>`;
   msgs.appendChild(div);
   scrollChat();
@@ -1031,8 +1041,34 @@ async function sendChat() {
   if (!text || !currentRoom) return;
   input.value = '';
   const time = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  const msg = { text, sender: myId, time };
   appendChat(text, true, time);
-  await db.channel('chat:'+currentRoom).send({ type:'broadcast', event:'msg', payload:{ text, sender:myId, time } });
+
+  // Broadcast live to others in room
+  await db.channel('chat:'+currentRoom).send({ type:'broadcast', event:'msg', payload: msg });
+
+  // Save to database for persistence
+  const { data } = await db.from('rooms').select('chat_messages').eq('id', currentRoom).single();
+  const existing = data?.chat_messages || [];
+  const updated = [...existing, msg].slice(-100); // keep last 100 messages
+  await db.from('rooms').update({ chat_messages: updated }).eq('id', currentRoom);
+}
+
+async function forceDownload(url, filename) {
+  try {
+    showToast('Downloading...');
+    const res = await fetch(url);
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  } catch(e) {
+    showToast('Download failed — try again', true);
+  }
 }
 
 function escapeHtml(t) {
